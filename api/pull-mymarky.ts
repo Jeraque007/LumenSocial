@@ -102,6 +102,11 @@ interface BrandReport {
   // Which shape MyMarky returned its continuation cursor in: 'string', 'object', 'none' (last page),
   // or 'object-unusable'. Anything other than 'none' with hasMore=true means we stopped reading early.
   nextShape?: string;
+  // How pagination was achieved: 'cursor', 'offset' (MyMarky sent no cursor, so we walked slices
+  // by offset), or 'none' (a single page held everything).
+  pagedBy?: string;
+  // True only when we hit the 10-page ceiling, i.e. there may be more beyond what we read.
+  stoppedEarly?: boolean;
   error?: string;
 }
 
@@ -264,38 +269,61 @@ export default async function handler(req: Request) {
       }
 
       // Fetch WITHOUT a status filter and filter locally below. Passing status=NEW&status=DRAFT made
-      // this endpoint return zero posts for every brand even though the accounts hold plenty -
-      // the repeated query param is not reliably honoured, and an empty result is indistinguishable
+      // this endpoint return zero posts for every brand even though the accounts hold plenty - the
+      // repeated query param is not reliably honoured, and an empty result is indistinguishable
       // from an empty account. Filtering client-side cannot fail that way.
       //
-      // Paged via `next` cursor rather than one big limit: MyMarky caps a page, and a single page
-      // returned only 60 rows where more exist - which would silently hide newer material and make
-      // a brand look stale. Follow the cursor so we see everything the account actually holds.
+      // MyMarky caps a page below the requested limit (asked for 100, got 60) and sends no cursor,
+      // so a cursor-only loop stops after page 1 and silently hides everything beyond it - which
+      // makes an account look stale when it is not. So: follow the cursor when there is one, and
+      // otherwise try an offset page once and keep going only while it yields posts we have not
+      // seen. If the API rejects `offset` or repeats itself, `fresh` hits 0 and we stop - this
+      // cannot fail a pull that was already working, it can only find more.
       const collected: MymarkyPost[] = [];
+      const seenPostIds = new Set<string>();
       let cursor: string | undefined;
+      let offset = 0;
       let pages = 0;
-      for (let page = 0; page < 25; page++) {
-        const url = MYMARKY_API + '/businesses/' + businessId + '/posts?limit=100' +
-          (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
-        const res = await fetch(url, { headers: { Authorization: 'Bearer ' + apiKey } });
-        if (!res.ok) {
-          report.error = 'MyMarky API ' + res.status;
+      let pagedBy = 'none';
+      let stoppedEarly = false;
+
+      const absorb = (batch: MymarkyPost[]): number => {
+        let fresh = 0;
+        for (const p of batch) {
+          const pid = p && typeof p === 'object' ? p.id : undefined;
+          if (!pid || seenPostIds.has(pid)) continue;
+          seenPostIds.add(pid);
+          collected.push(p);
+          fresh++;
+        }
+        return fresh;
+      };
+
+      for (let page = 0; page < 10; page++) {
+        const qs = 'limit=100' +
+          (cursor ? '&cursor=' + encodeURIComponent(cursor) : '') +
+          (!cursor && page > 0 ? '&offset=' + offset : '');
+        const url = MYMARKY_API + '/businesses/' + businessId + '/posts?' + qs;
+        let res: Response | null = null;
+        try {
+          res = await fetch(url, { headers: { Authorization: 'Bearer ' + apiKey }, signal: AbortSignal.timeout(20000) });
+        } catch { res = null; }
+        if (!res || !res.ok) {
+          // Only the FIRST request failing is a real error. A later page being rejected just means
+          // this API does not support that paging style, and the posts already collected stand.
+          if (page === 0) report.error = res ? 'MyMarky API ' + res.status : 'MyMarky unreachable';
           break;
         }
-        const pageBody = await res.json();
+        const pageBody = await res.json().catch(() => null);
         const pagePosts: MymarkyPost[] = Array.isArray(pageBody?.items) ? pageBody.items
           : Array.isArray(pageBody?.data) ? pageBody.data
           : Array.isArray(pageBody) ? pageBody
           : [];
-        collected.push(...pagePosts);
+        const fresh = absorb(pagePosts);
         pages++;
-        // Guard against a cursor that repeats: without this, a non-advancing cursor would spin
-        // the same page 25 times and pad the result with duplicates.
-        // `next` is documented as a bare cursor string, but if the API ever returns it as an object
-        // ({cursor: '...'}) or under an alias, a string-only check silently yields undefined and the
-        // loop stops after page 1 - which looks identical to "the account only holds this many
-        // posts". Accept every plausible shape and report which one arrived, so a truncated read is
-        // visible in the diagnostics instead of being mistaken for an empty account.
+
+        // `next` may be a bare string, an object, or under an alias; a string-only check would
+        // silently stop after page 1. Report which shape arrived so a truncated read is visible.
         const rawNext = pageBody?.next ?? pageBody?.cursor ?? null;
         let nextCursor: string | undefined;
         if (typeof rawNext === 'string' && rawNext) {
@@ -311,14 +339,27 @@ export default async function handler(req: Request) {
           }
         }
         if (report.nextShape === undefined) report.nextShape = 'none';
-        if (!nextCursor || nextCursor === cursor) break;
-        cursor = nextCursor;
-        if (pagePosts.length === 0) break;
+
+        if (nextCursor && nextCursor !== cursor) {
+          pagedBy = 'cursor';
+          cursor = nextCursor;
+          if (fresh === 0) break; // repeat page guard
+          continue;
+        }
+
+        // No cursor. Stop if this page produced nothing new, otherwise ask for the next slice.
+        if (fresh === 0) break;
+        offset = collected.length;
+        pagedBy = offset > 0 ? 'offset' : 'none';
+        if (page === 9) stoppedEarly = true;
       }
+      report.pagedBy = pagedBy;
+      report.stoppedEarly = stoppedEarly || undefined;
+
       const posts: MymarkyPost[] = collected;
       report.fetchedPosts = posts.length;
       report.pagesFetched = pages;
-      report.hasMore = cursor !== undefined;
+      report.hasMore = stoppedEarly;
       if (posts.length === 0) {
         report.error = 'MyMarky returned 0 posts for this business';
         continue;

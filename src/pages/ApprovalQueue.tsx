@@ -329,6 +329,29 @@ export function ApprovalQueue() {
           <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: 0 }}>
             What MyMarky actually returns for this account. Plain-language summary first, raw detail below.
           </p>
+          {/* The answer itself, not raw JSON. One sentence that decides between "more material
+              exists behind page 1" and "this account genuinely holds nothing newer". */}
+          {probeResult.verdict && (
+            <div
+              style={{
+                padding: '0.75rem 1rem',
+                borderRadius: '6px',
+                marginBottom: '1rem',
+                fontSize: '0.95rem',
+                fontWeight: 600,
+                background: probeResult.verdict.startsWith('FOUND IT') ? 'rgba(220, 180, 40, 0.18)' : 'rgba(120, 200, 140, 0.15)',
+                border: '1px solid var(--border)',
+                color: 'var(--text)',
+              }}
+            >
+              {probeResult.verdict}
+            </div>
+          )}
+          {probeResult.elapsedSec && (
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
+              Took {probeResult.elapsedSec}s.
+            </p>
+          )}
           {Array.isArray(probeResult.results) && (
             <div style={{ overflowX: 'auto', marginBottom: '1rem' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
