@@ -14,6 +14,14 @@ const BRANDS: Record<string, { key?: string; id?: string; fallback: string }> = 
   hoaws: { key: 'MYMARKY_API_KEY_HOAWS', id: 'MYMARKY_BUSINESS_ID_HOAWS', fallback: 'd36bd055-5dca-49e7-b1d4-2f218e6c051f' },
 };
 
+// RUNTIME MUST MATCH api/pull-mymarky.ts.
+//
+// This probe previously had no `config`, so Vercel ran it on Node.js while pull-mymarky.ts ran on
+// the edge runtime - the probe therefore could NOT reproduce the pull's failure mode. That is
+// exactly what happened: the pull failed on edge while the probe reported healthy, which sent the
+// investigation in the wrong direction for hours. Same runtime, same fetch, same result.
+export const config = { runtime: 'edge', maxDuration: 60 };
+
 export default async function handler(req: Request) {
   // Everything is wrapped because a 500 tells us nothing: an unhandled throw returns Vercel's
   // own error page, not our JSON, so the UI shows an empty error and we learn nothing. This
@@ -57,10 +65,16 @@ export default async function handler(req: Request) {
     const started = Date.now();
     const results = await Promise.all(attempts.map(async (attempt) => {
       const url = MYMARKY_API + '/businesses/' + businessId + '/posts?' + attempt.qs;
+      // AbortController + setTimeout instead of AbortSignal.timeout(). This repo's MyMarky
+      // endpoints declare `runtime: 'edge'`, where AbortSignal.timeout is missing and throws;
+      // using it here risks the probe being the very thing that fails. The catch below treats the
+      // resulting AbortError the same way as a timeout, so the verdict still reads correctly.
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), PER_REQUEST_MS);
       try {
         const res = await fetch(url, {
           headers: { Authorization: 'Bearer ' + apiKey },
-          signal: AbortSignal.timeout(PER_REQUEST_MS),
+          signal: ctrl.signal,
         });
         const text = await res.text();
         let body: unknown;
@@ -127,6 +141,9 @@ export default async function handler(req: Request) {
           timedOut: aborted || undefined,
           ids: [] as string[],
         };
+      } finally {
+        // Without this the timer would outlive the request and hold the event loop.
+        clearTimeout(timer);
       }
     }));
 

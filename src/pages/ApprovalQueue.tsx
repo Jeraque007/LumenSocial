@@ -61,14 +61,18 @@ export function ApprovalQueue() {
   async function handleProbe() {
     setProbing(true);
     setProbeResult(null);
+    const probeCancel = new AbortController();
+    const probeTimer = window.setTimeout(() => probeCancel.abort(), 45000);
     try {
       const adminPw = sessionStorage.getItem('lumensocial_pw') || '';
       const res = await fetch('/api/mymarky-probe?brand=' + probeBrand, {
         method: 'POST',
         headers: { 'x-admin-password': adminPw },
-        // Hard client-side stop. The server bounds each MyMarky call, but if the function itself
-        // never responds the button must still recover rather than spin indefinitely.
-        signal: AbortSignal.timeout(60000),
+        // Hard client-side stop via AbortController. The server bounds each MyMarky call, but if the
+        // function itself never responds the button must still recover rather than spin forever.
+        // AbortController, not AbortSignal.timeout(): that static is missing in older browsers and
+        // throwing there would abort before the fetch even starts, leaving a stuck spinner.
+        signal: probeCancel.signal,
       });
       const data = await res.json().catch(() => null);
       setProbeResult(data || { error: 'No response from server (HTTP ' + res.status + ')' });
@@ -76,11 +80,12 @@ export function ApprovalQueue() {
       const timedOut = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
       setProbeResult({
         error: timedOut
-          ? 'Took longer than 60 seconds and was stopped. MyMarky is not responding - this is an upstream problem, not a bug in LumenSocial.'
+          ? 'Stopped after 45 seconds with no answer from the server. Check the Vercel function log for /api/mymarky-probe.'
           : 'Request failed: ' + (err instanceof Error ? err.message : String(err)),
       });
     } finally {
       // Always clear the spinner, whatever happened above.
+      window.clearTimeout(probeTimer);
       setProbing(false);
     }
   }
@@ -88,6 +93,11 @@ export function ApprovalQueue() {
   async function handlePullMymarky() {
     setPulling(true);
     setPullResult(null);
+    // AbortController + setTimeout rather than AbortSignal.timeout(). The timeout static is missing
+    // in older browsers and, when it throws, the handler aborts before it reaches the fetch - which
+    // is how a "why is this stuck" bug gets misread as a server-side failure.
+    const pullCancel = new AbortController();
+    const pullTimer = window.setTimeout(() => pullCancel.abort(), 90000);
     try {
       const adminPw = sessionStorage.getItem('lumensocial_pw') || '';
       const params = new URLSearchParams({
@@ -99,6 +109,9 @@ export function ApprovalQueue() {
       const res = await fetch('/api/pull-mymarky?' + params.toString(), {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + adminPw, 'Content-Type': 'application/json' },
+        // The pull can legitimately take a while over three brands, but it must never hang the
+        // button forever. No signal support relied on: AbortController works in every browser.
+        signal: pullCancel.signal,
       });
       const data = await res.json().catch(() => null);
       if (res.ok && data?.success) {
@@ -109,7 +122,13 @@ export function ApprovalQueue() {
         setPullResult(data || { error: res.statusText });
         alert('Pull failed: ' + (data?.error || res.statusText));
       }
-    } catch (err) { alert('Request failed: ' + err); }
+    } catch (err) {
+      const aborted = err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError');
+      alert(aborted
+        ? 'Pull timed out after 90 seconds. Check the Vercel function logs before retrying.'
+        : 'Request failed: ' + err);
+    }
+    window.clearTimeout(pullTimer);
     setPulling(false);
   }
 

@@ -11,8 +11,8 @@
 // MODES (?mode=)
 //   fresh  (default) import only what rule 1 allows
 //   force  re-import, ignoring rule 2 (creates duplicates; still respects rules 1 and 3)
-//   reset  delete unpublished MyMarky rows first, then import. Published rows and the
-//          mymarky_seen ledger are KEPT, so released and previously-pulled material stays blocked.
+//   reset  delete unpublished MyMarky rows and clear the mymarky_seen ledger first, then import.
+//          Published rows are KEPT, so rule 3 still blocks anything already released.
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(
@@ -145,6 +145,28 @@ function getNextWeekday(from: Date, offset: number): Date {
   return date;
 }
 
+// Portable timeout for an outbound fetch.
+//
+// THIS EXISTS BECAUSE AbortSignal.timeout() IS NOT AVAILABLE IN THE RUNTIME THIS FILE RUNS ON.
+// pull-mymarky.ts declares `runtime: 'edge'`, where AbortSignal.timeout is missing: calling it
+// throws a TypeError, my catch turned that into res = null, and the loop then reported
+// "MyMarky returned 0 posts for this business" for ALL THREE BRANDS - i.e. nothing imported on
+// fresh, force or reset, at any window size. It was added in commit 44edce4 and nothing has
+// imported since. AbortController + setTimeout is supported everywhere, so use that instead.
+async function fetchWithTimeout(url: string, headers: Record<string, string>, ms: number): Promise<Response | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { headers, signal: ctrl.signal });
+  } catch {
+    // A timeout or network failure. Returning null keeps the caller's distinction between
+    // "first request failed - report it" and "a later page failed - keep what we already have".
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // PostgREST caps a plain select at 1000 rows, so page rather than silently truncating.
 async function fetchAll<T>(table: string, columns: string, filterNotNull?: string): Promise<T[]> {
   const rows: T[] = [];
@@ -184,8 +206,16 @@ export default async function handler(req: Request) {
     const reports: BrandReport[] = [];
     let totalImported = 0;
 
-    // Reset: clear unpublished MyMarky rows so our own backlog stops blocking rule 2.
-    // Published rows stay (they are rule 3's memory) and mymarky_seen is never touched.
+    // Reset: clear unpublished MyMarky rows AND the already-pulled ledger.
+    //
+    // This used to leave mymarky_seen untouched, which made `reset` a permanent no-op: the rows
+    // were deleted, but every source post was still recorded in the ledger, so rule 2 skipped all
+    // of them and the pull imported nothing - no matter whether the window was 5, 7 or 25 days.
+    // Deleting the rows only ever freed `queuedSigs`, never `seenIds`.
+    //
+    // Published rows are NOT deleted, so `releasedSigs` still blocks anything already released -
+    // rule 3 survives the reset. That is the protection worth keeping, and it does not depend on
+    // the ledger.
     if (reset) {
       const { data, error } = await supabase
         .from('scheduled_posts')
@@ -198,6 +228,8 @@ export default async function handler(req: Request) {
         const { error: delErr } = await supabase.from('scheduled_posts').delete().in('id', ids);
         if (delErr) throw new Error('reset delete failed: ' + delErr.message);
       }
+      const { error: ledgerErr } = await supabase.from('mymarky_seen').delete().neq('id', 0);
+      if (ledgerErr) throw new Error('reset ledger clear failed: ' + ledgerErr.message);
     }
 
     // RULE 2 memory: every MyMarky post ever pulled, per brand. Survives deletion of the
@@ -305,9 +337,9 @@ export default async function handler(req: Request) {
           (!cursor && page > 0 ? '&offset=' + offset : '');
         const url = MYMARKY_API + '/businesses/' + businessId + '/posts?' + qs;
         let res: Response | null = null;
-        try {
-          res = await fetch(url, { headers: { Authorization: 'Bearer ' + apiKey }, signal: AbortSignal.timeout(20000) });
-        } catch { res = null; }
+        // fetchWithTimeout, not AbortSignal.timeout: this file runs on the edge runtime, where
+        // AbortSignal.timeout does not exist and throws - which turned into "0 posts" for every brand.
+        res = await fetchWithTimeout(url, { Authorization: 'Bearer ' + apiKey }, 20000);
         if (!res || !res.ok) {
           // Only the FIRST request failing is a real error. A later page being rejected just means
           // this API does not support that paging style, and the posts already collected stand.
