@@ -103,6 +103,12 @@ interface BrandReport {
   // How many posts rule 1 would accept from the workspace actually read. 0 here with a non-zero
   // fetchedPosts means the window or the statuses rejected everything - not that MyMarky was empty.
   importableInWindow?: number;
+  // The exact weekdays this run wrote to, in order. "I asked for 5 days" is unanswerable from an
+  // imported count alone - this is where the posts actually landed.
+  placedOn?: string[];
+  // Slots refused because the brand already had content on that day. Non-zero means the pull
+  // stepped over a day it would previously have duplicated onto.
+  steppedOverUsedDays?: number;
   // How many posts MyMarky actually returned for this workspace. Compare across brands: a brand
   // returning far fewer rows than the others usually means the env var points at the wrong
   // workspace rather than that the workspace is empty.
@@ -392,18 +398,32 @@ export default async function handler(req: Request) {
     );
 
     // Where each brand's calendar currently ends, so a new pull continues after it instead of
-    // restarting at next Monday and stacking a second post on the same weekday.
+    // restarting at today and stacking a second post on a weekday that already went out.
+    //
+    // THIS USED TO FILTER TO draft/pending ONLY. Published rows therefore did not count, and a day
+    // that had already been posted to looked EMPTY: once a brand's week of drafts had all been
+    // released the map came back without that brand, `scheduleStart` fell back to `new Date()`, and
+    // the next pull re-plotted from today straight onto weekdays that were already live on the
+    // social networks - the "duplicate on Monday 5th, already posted" report. Every status means the
+    // calendar is occupied there, so no status is filtered out.
     const latestByBrand = new Map<string, number>();
-    const { data: pending } = await supabase
+    // Per brand, every YYYY-MM-DD that already carries content. `latest` alone is not enough: a brand
+    // can hold an old published day with no later row, and then nothing points at the blocked day.
+    const usedDays = new Map<string, Set<string>>();
+    const { data: existingRows } = await supabase
       .from('scheduled_posts')
-      .select('brand, scheduled_at')
-      .in('status', ['draft', 'pending']);
-    for (const row of pending || []) {
+      .select('brand, scheduled_at, status');
+    for (const row of existingRows || []) {
       const b = row.brand as string | null;
       const t = Date.parse(row.scheduled_at as string);
       if (!b || Number.isNaN(t)) continue;
       const prev = latestByBrand.get(b);
       if (prev === undefined || t > prev) latestByBrand.set(b, t);
+      const day = String(row.scheduled_at).slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
+      let set = usedDays.get(b);
+      if (!set) { set = new Set<string>(); usedDays.set(b, set); }
+      set.add(day);
     }
 
     for (const brand of BRANDS) {
@@ -596,14 +616,32 @@ export default async function handler(req: Request) {
           continue;
         }
 
-        // Continue after this brand's last scheduled post rather than restarting from today, otherwise
+      // Continue after this brand's last scheduled post rather than restarting from today, otherwise
       // a second pull targets the same weekdays again and stacks a duplicate post per platform.
       const scheduleStart = latestByBrand.get(brand.name);
-      const scheduleDate = getNextWeekday(
+      const alreadyUsed = usedDays.get(brand.name) || new Set<string>();
+      usedDays.set(brand.name, alreadyUsed);
+      let scheduleDate = getNextWeekday(
         scheduleStart !== undefined ? new Date(scheduleStart) : new Date(),
         slots + 1
       );
+      // Step over any day this brand already has content on. `latest` above usually lands clear of
+      // them, but when it does not - an old published day, or a gap in the calendar - falling back
+      // would put fresh material on a weekday that already went out. 60 is a hard stop so a
+      // pathological calendar can never spin here.
+      let stepped = false;
+      for (let guard = 0; guard < 60; guard++) {
         scheduleDate.setUTCHours(brand.scheduleHour, 0, 0, 0);
+        const day = scheduleDate.toISOString().slice(0, 10);
+        if (!alreadyUsed.has(day)) break;
+        stepped = true;
+        scheduleDate = getNextWeekday(scheduleDate, 1);
+      }
+      if (stepped) report.steppedOverUsedDays = (report.steppedOverUsedDays || 0) + 1;
+      // Reserve it, so the next slot of this same pull cannot land here too.
+      alreadyUsed.add(scheduleDate.toISOString().slice(0, 10));
+      report.placedOn = report.placedOn || [];
+      report.placedOn.push(scheduleDate.toISOString());
 
         let insertedAny = false;
         for (const platform of PLATFORMS) {
@@ -667,6 +705,9 @@ export default async function handler(req: Request) {
       success: true,
       imported: totalImported,
       mode,
+      // Echoed so "I asked for 5 days" can be checked against what came back rather than inferred
+      // from the imported count. `days` is the weekday-slot budget per brand, not a date range.
+      requestedDays: maxPosts,
       since_days: sinceDays,
       brands: reports,
       message: 'Imported ' + totalImported + ' platform posts',
