@@ -1,0 +1,88 @@
+// TEMPORARY diagnostic endpoint - safe to delete once the MyMarky list shape is confirmed.
+//
+// Hits the MyMarky posts endpoint directly and reports the RAW shape of the response, plus the
+// keys of the first post. This exists because the pull's own diagnostics could not distinguish
+// "the account holds only these posts" from "we read one capped page and stopped" - both look
+// identical (60 posts, no cursor). This endpoint answers it by showing what actually came back.
+//
+// Auth: same ADMIN_PASSWORD as /api/auth-check. Never echoes the API key or any token.
+const MYMARKY_API = 'https://api.mymarky.ai/api';
+
+const BRANDS: Record<string, { key?: string; id?: string; fallback: string }> = {
+  sae: { key: 'MYMARKY_API_KEY_SAE', id: 'MYMARKY_BUSINESS_ID_SAE', fallback: '9a1b5ac9-007a-4018-8edf-8a21971ae049' },
+  tessera: { key: 'MYMARKY_API_KEY_TESSERA', id: 'MYMARKY_BUSINESS_ID_TESSERA', fallback: '1ad527e6-b88b-43bb-a195-342ce3da1af6' },
+  hoaws: { key: 'MYMARKY_API_KEY_HOAWS', id: 'MYMARKY_BUSINESS_ID_HOAWS', fallback: 'd36bd055-5dca-49e7-b1d4-2f218e6c051f' },
+};
+
+export default async function handler(req: Request) {
+  if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+
+  const adminPassword = process.env.ADMIN_PASSWORD;
+  if (!adminPassword) return new Response('Server not configured', { status: 500 });
+  if (req.headers.get('x-admin-password') !== adminPassword) {
+    return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+      status: 401, headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  const slug = (new URL(req.url).searchParams.get('brand') || 'sae').toLowerCase();
+  const brand = BRANDS[slug];
+  if (!brand) return new Response(JSON.stringify({ error: 'Unknown brand: ' + slug }), { status: 400 });
+
+  const apiKey = (process.env[brand.key!] || '').trim();
+  const businessId = (process.env[brand.id!] || '').trim() || brand.fallback;
+  if (!apiKey) return new Response(JSON.stringify({ error: 'No API key for ' + slug }), { status: 400 });
+
+  // Try several query shapes. If one returns more posts, or a cursor the normal pull ignores,
+  // that difference is the bug.
+  const attempts = [
+    { label: 'limit=100 (what the pull uses)', qs: 'limit=100' },
+    { label: 'limit=100&status=NEW', qs: 'limit=100&status=NEW' },
+    { label: 'limit=100&sort=-created_at', qs: 'limit=100&sort=-created_at' },
+    { label: 'limit=100&order=desc', qs: 'limit=100&order=desc' },
+    { label: 'no params', qs: '' },
+  ];
+
+  const results = [];
+  for (const attempt of attempts) {
+    const url = MYMARKY_API + '/businesses/' + businessId + '/posts' + (attempt.qs ? '?' + attempt.qs : '');
+    try {
+      const res = await fetch(url, { headers: { Authorization: 'Bearer ' + apiKey } });
+      const text = await res.text();
+      let body: unknown;
+      try { body = JSON.parse(text); } catch { body = null; }
+      const obj = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+      const items = Array.isArray(obj.items) ? obj.items
+        : Array.isArray(obj.data) ? obj.data
+        : Array.isArray(body) ? (body as unknown[])
+        : null;
+      results.push({
+        query: attempt.label,
+        httpStatus: res.status,
+        topLevelKeys: Object.keys(obj),
+        returnedCount: items ? items.length : null,
+        // The single most useful fact: what key holds the continuation cursor, if any.
+        cursorFieldsPresent: Object.keys(obj).filter(k => /next|cursor|offset|page|has_?more/i.test(k)),
+        hasMore: obj.has_more ?? obj.hasMore ?? null,
+        nextRaw: typeof obj.next === 'string' ? obj.next.slice(0, 80)
+          : obj.next ? JSON.stringify(obj.next).slice(0, 120) : null,
+        // Field names on a post - reveals if the date is called something other than created_at,
+        // which would make every post look ancient.
+        postKeys: items && items.length ? Object.keys(items[0] as object) : null,
+        sampleDates: items ? items.slice(0, 3).map((p: Record<string, unknown>) => ({
+          id: p.id, status: p.status,
+          created_at: p.created_at ?? null,
+          // Any other date-ish field, so a mis-named timestamp is visible.
+          otherDates: Object.fromEntries(Object.entries(p).filter(([k]) => /date|time|_at$/i.test(k) && k !== 'created_at')),
+        })) : null,
+        errorBodyPreview: res.ok ? null : text.slice(0, 200),
+      });
+    } catch (e) {
+      results.push({ query: attempt.label, error: String(e).slice(0, 200) });
+    }
+  }
+
+  return new Response(JSON.stringify({ brand: slug, businessId, results }, null, 2), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
