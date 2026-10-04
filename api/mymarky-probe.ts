@@ -47,11 +47,19 @@ export default async function handler(req: Request) {
       { label: 'no params', qs: '' },
     ];
 
+    // A single hanging request must not stall the whole check, so every call is bounded. Without
+    // this, one unresponsive MyMarky endpoint leaves the button spinning with no result at all.
+    const PER_REQUEST_MS = 8000;
+    const TIMEOUT_ERR = 'Timed out after ' + (PER_REQUEST_MS / 1000) + 's - MyMarky did not respond';
+
     const results = [];
     for (const attempt of attempts) {
       const url = MYMARKY_API + '/businesses/' + businessId + '/posts' + (attempt.qs ? '?' + attempt.qs : '');
       try {
-        const res = await fetch(url, { headers: { Authorization: 'Bearer ' + apiKey } });
+        const res = await fetch(url, {
+          headers: { Authorization: 'Bearer ' + apiKey },
+          signal: AbortSignal.timeout(PER_REQUEST_MS),
+        });
         const text = await res.text();
         let body: unknown;
         try { body = JSON.parse(text); } catch { body = null; }
@@ -98,7 +106,14 @@ export default async function handler(req: Request) {
           errorBodyPreview: res.ok ? null : text.slice(0, 300),
         });
       } catch (e) {
-        results.push({ query: attempt.label, error: e instanceof Error ? e.message : String(e).slice(0, 200) });
+        // A timeout is the expected failure here, so name it plainly instead of surfacing the
+        // raw "operation was aborted" message, which reads like a crash.
+        const aborted = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
+        results.push({
+          query: attempt.label,
+          error: aborted ? TIMEOUT_ERR : (e instanceof Error ? e.message : String(e)).slice(0, 200),
+          timedOut: aborted || undefined,
+        });
       }
     }
 

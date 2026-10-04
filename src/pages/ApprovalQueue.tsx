@@ -66,13 +66,23 @@ export function ApprovalQueue() {
       const res = await fetch('/api/mymarky-probe?brand=' + probeBrand, {
         method: 'POST',
         headers: { 'x-admin-password': adminPw },
+        // Hard client-side stop. The server bounds each MyMarky call, but if the function itself
+        // never responds the button must still recover rather than spin indefinitely.
+        signal: AbortSignal.timeout(60000),
       });
       const data = await res.json().catch(() => null);
-      setProbeResult(data || { error: res.statusText });
+      setProbeResult(data || { error: 'No response from server (HTTP ' + res.status + ')' });
     } catch (err) {
-      setProbeResult({ error: String(err) });
+      const timedOut = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
+      setProbeResult({
+        error: timedOut
+          ? 'Took longer than 60 seconds and was stopped. MyMarky is not responding - this is an upstream problem, not a bug in LumenSocial.'
+          : 'Request failed: ' + (err instanceof Error ? err.message : String(err)),
+      });
+    } finally {
+      // Always clear the spinner, whatever happened above.
+      setProbing(false);
     }
-    setProbing(false);
   }
 
   async function handlePullMymarky() {
