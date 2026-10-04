@@ -18,8 +18,8 @@
 const MYMARKY_API = 'https://api.mymarky.ai/api';
 
 const BRANDS: Record<string, { key?: string; id?: string; fallback: string }> = {
-  sae: { key: 'MYMARKY_API_KEY_SAE', id: 'MYMARKY_BUSINESS_ID_SAE', fallback: '9a1b5ac9-007a-4018-8edf-8a21971ae049' },
-  tessera: { key: 'MYMARKY_API_KEY_TESSERA', id: 'MYMARKY_BUSINESS_ID_TESSERA', fallback: '1ad527e6-b88b-43bb-a195-342ce3da1af6' },
+  sae: { key: 'MYMARKY_API_KEY_SAE', id: 'MYMARKY_BUSINESS_ID_SAE', fallback: 'cd72203a-32bf-4832-9b72-6bb767b2da90' },
+  tessera: { key: 'MYMARKY_API_KEY_TESSERA', id: 'MYMARKY_BUSINESS_ID_TESSERA', fallback: 'e2258821-9e9a-43b0-bff3-0e7419d6368a' },
   hoaws: { key: 'MYMARKY_API_KEY_HOAWS', id: 'MYMARKY_BUSINESS_ID_HOAWS', fallback: 'd36bd055-5dca-49e7-b1d4-2f218e6c051f' },
 };
 

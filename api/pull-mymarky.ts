@@ -38,13 +38,18 @@ const BRANDS = [
   {
     name: 'S.A.E Method',
     apiKey: () => process.env.MYMARKY_API_KEY_SAE || '',
-    businessId: () => process.env.MYMARKY_BUSINESS_ID_SAE || '9a1b5ac9-007a-4018-8edf-8a21971ae049',
+    // 2026-10-04: replaced 9a1b5ac9-... . The old id still answers /businesses/{id}/posts, but only
+    // with a 60-post batch created 2026-07-26 and nothing since - while the live workspace with 60
+    // importable posts a week old sits under this id on the SAME API key. resolveWorkspace() below
+    // catches this case automatically, so the fallback matters mainly for the report.
+    businessId: () => process.env.MYMARKY_BUSINESS_ID_SAE || 'cd72203a-32bf-4832-9b72-6bb767b2da90',
     scheduleHour: 8,
   },
   {
     name: 'Tessera Lumen',
     apiKey: () => process.env.MYMARKY_API_KEY_TESSERA || '',
-    businessId: () => process.env.MYMARKY_BUSINESS_ID_TESSERA || '1ad527e6-b88b-43bb-a195-342ce3da1af6',
+    // 2026-10-04: replaced 1ad527e6-... for the same reason as S.A.E above.
+    businessId: () => process.env.MYMARKY_BUSINESS_ID_TESSERA || 'e2258821-9e9a-43b0-bff3-0e7419d6368a',
     scheduleHour: 13,
   },
   {
@@ -90,6 +95,14 @@ interface BrandReport {
   // content, this is how you confirm the env var points at the right business.
   businessId?: string;
   businessIdFromEnv?: boolean;
+  // Set only when the configured workspace had nothing importable while another workspace under the
+  // same API key did. Names both, so a workspace switch can never be mistaken for "the env var was
+  // right all along".
+  workspaceSwitchedFrom?: string;
+  workspaceName?: string;
+  // How many posts rule 1 would accept from the workspace actually read. 0 here with a non-zero
+  // fetchedPosts means the window or the statuses rejected everything - not that MyMarky was empty.
+  importableInWindow?: number;
   // How many posts MyMarky actually returned for this workspace. Compare across brands: a brand
   // returning far fewer rows than the others usually means the env var points at the wrong
   // workspace rather than that the workspace is empty.
@@ -165,6 +178,121 @@ async function fetchWithTimeout(url: string, headers: Record<string, string>, ms
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ---- Workspace resolution -------------------------------------------------
+//
+// A MyMarky business id can outlive the workspace it points at.
+//
+// On 2026-10-04 both S.A.E and Tessera were importing nothing but 70-day-old material while holding
+// 60 importable posts a week old. The configured ids (9a1b5ac9-... and 1ad527e6-...) still answer
+// /businesses/{id}/posts - they just answer with a single bulk batch created 2026-07-26 and
+// nothing since. The live workspaces sit under DIFFERENT ids under the SAME API key. From inside
+// LumenSocial that is indistinguishable from "the account has no new material", which is exactly
+// what these two brands reported for weeks.
+//
+// So never trust an id just because it was configured. Read it first; only if it holds nothing we
+// could import do we ask which other workspaces the key can see. An id that works costs one extra
+// request (the HOAWS case); an id that has gone stale gets corrected instead of silently ignored.
+
+function extractPosts(body: unknown): MymarkyPost[] {
+  if (!body) return [];
+  if (Array.isArray(body)) return body as MymarkyPost[];
+  const b = body as Record<string, unknown>;
+  if (Array.isArray(b.items)) return b.items as MymarkyPost[];
+  if (Array.isArray(b.data)) return b.data as MymarkyPost[];
+  return [];
+}
+
+function pickArray(body: unknown, keys: string[]): any[] {
+  if (!body) return [];
+  if (Array.isArray(body)) return body;
+  const b = body as Record<string, unknown>;
+  for (const k of keys) if (Array.isArray(b[k])) return b[k] as any[];
+  return [];
+}
+
+function newestCreatedMs(posts: MymarkyPost[]): number {
+  let max = 0;
+  for (const p of posts) {
+    const t = Date.parse((p && p.created_at) || '');
+    if (!Number.isNaN(t) && t > max) max = t;
+  }
+  return max;
+}
+
+// How many posts rule 1 would accept from this workspace. 0 means the pull could import nothing
+// from it, whatever else the workspace holds - which is the whole test for "is this the right id".
+function importableInWindow(posts: MymarkyPost[], cutoff: number): number {
+  let n = 0;
+  for (const p of posts) {
+    if (!p || !IMPORTABLE_STATUSES.has(p.status || '')) continue;
+    const t = Date.parse(p.created_at || '');
+    if (Number.isNaN(t)) continue;
+    if (cutoff > 0 && t < cutoff) continue;
+    n++;
+  }
+  return n;
+}
+
+interface WorkspaceChoice {
+  id: string;
+  name?: string;
+  // The id we started from and abandoned. Present only when a switch actually happened.
+  switchedFrom?: string;
+  importable: number;
+}
+
+async function resolveWorkspace(apiKey: string, configuredId: string, cutoff: number): Promise<WorkspaceChoice> {
+  const headers = { Authorization: 'Bearer ' + apiKey };
+
+  // Step 1: does the configured workspace still hold anything we could import? If yes, stop here -
+  // this is the happy path and must not change behaviour for a brand that is already working.
+  const first = await fetchWithTimeout(
+    MYMARKY_API + '/businesses/' + configuredId + '/posts?limit=100', headers, 20000
+  );
+  if (first && first.ok) {
+    const body = await first.json().catch(() => null);
+    const n = importableInWindow(extractPosts(body), cutoff);
+    if (n > 0) return { id: configuredId, importable: n };
+  }
+
+  // Step 2: stale or unreadable. Ask which workspaces this key can see and pick the one that would
+  // actually import. Kept deliberately conservative - a candidate must hold importable posts, and
+  // ties go to the workspace with the newest material.
+  const listRes = await fetchWithTimeout(MYMARKY_API + '/businesses?limit=100', headers, 20000);
+  if (!listRes || !listRes.ok) return { id: configuredId, importable: 0 };
+
+  const listBody = await listRes.json().catch(() => null);
+  const candidates = pickArray(listBody, ['businesses', 'data', 'items', 'results', 'rows'])
+    .filter((b: any) => b && (typeof b.id === 'string' || typeof b.business_id === 'string'))
+    .slice(0, 12);
+
+  const scored = await Promise.all(
+    candidates.map(async (b: any) => {
+      const id = String(b.id || b.business_id);
+      if (id === configuredId) return null;
+      const res = await fetchWithTimeout(
+        MYMARKY_API + '/businesses/' + id + '/posts?limit=100', headers, 20000
+      );
+      if (!res || !res.ok) return null;
+      const posts = extractPosts(await res.json().catch(() => null));
+      return {
+        id,
+        name: typeof b.name === 'string' ? b.name : '',
+        count: importableInWindow(posts, cutoff),
+        newest: newestCreatedMs(posts),
+      };
+    })
+  );
+
+  let best: { id: string; name: string; count: number; newest: number } | null = null;
+  for (const c of scored) {
+    if (!c || c.count <= 0) continue;
+    if (!best || c.count > best.count || (c.count === best.count && c.newest > best.newest)) best = c;
+  }
+  if (!best) return { id: configuredId, importable: 0 };
+  return { id: best.id, name: best.name || '(unnamed)', switchedFrom: configuredId, importable: best.count };
 }
 
 // PostgREST caps a plain select at 1000 rows, so page rather than silently truncating.
@@ -289,15 +417,28 @@ export default async function handler(req: Request) {
       reports.push(report);
 
       const apiKey = brand.apiKey();
-      const businessId = brand.businessId();
+      const configuredId = brand.businessId();
       // Echo the workspace actually queried, and whether it came from env or the built-in
       // fallback. A wrong business_id looks exactly like "no new material", so this must be
       // visible in the report rather than inferred.
-      report.businessId = businessId || '(none)';
-      report.businessIdFromEnv = !!businessId;
-      if (!apiKey || !businessId) {
+      report.businessId = configuredId || '(none)';
+      report.businessIdFromEnv = !!configuredId;
+      if (!apiKey || !configuredId) {
         report.error = apiKey ? 'Business ID not configured' : 'API key not configured';
         continue;
+      }
+
+      // A configured id can silently point at a workspace that no longer holds anything importable
+      // while the live workspace sits under a different id on the same key. resolveWorkspace reads
+      // the configured id first and only goes looking when it comes back empty - see the note above
+      // its definition for why this cannot be left to configuration.
+      const choice = await resolveWorkspace(apiKey, configuredId, cutoff);
+      const businessId = choice.id;
+      report.businessId = businessId;
+      report.importableInWindow = choice.importable;
+      if (choice.switchedFrom) {
+        report.workspaceSwitchedFrom = choice.switchedFrom;
+        report.workspaceName = choice.name || '(unnamed)';
       }
 
       // Fetch WITHOUT a status filter and filter locally below. Passing status=NEW&status=DRAFT made
@@ -539,4 +680,6 @@ export default async function handler(req: Request) {
   }
 }
 
-export const config = { runtime: 'edge' };
+// maxDuration: 60 matches api/mymarky-probe.ts. resolveWorkspace() may read several workspaces
+// when a business id has gone stale, and a pull must not be cut off mid-brand because of it.
+export const config = { runtime: 'edge', maxDuration: 60 };
