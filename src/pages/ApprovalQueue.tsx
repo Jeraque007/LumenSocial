@@ -48,9 +48,32 @@ export function ApprovalQueue() {
   const [libraryType, setLibraryType] = useState<'image' | 'video'>('image');
   const [uploading, setUploading] = useState(false);
   const [pulling, setPulling] = useState(false);
+  const [probing, setProbing] = useState(false);
+  const [probeResult, setProbeResult] = useState<any>(null);
+  const [probeBrand, setProbeBrand] = useState<'sae' | 'tessera' | 'hoaws'>('sae');
   const [pullDays, setPullDays] = useState(10);
   // How far back to accept MyMarky material, in days. Anything older is skipped. 0 = no limit.
   const [pullSinceDays, setPullSinceDays] = useState(30);
+
+  // Asks MyMarky what its posts endpoint actually returns, instead of inferring it. The pull can
+  // only report what it read - when every brand reports the same 60 posts with no cursor, this is
+  // the only way to tell a capped page from a genuinely small account.
+  async function handleProbe() {
+    setProbing(true);
+    setProbeResult(null);
+    try {
+      const adminPw = sessionStorage.getItem('lumensocial_pw') || '';
+      const res = await fetch('/api/mymarky-probe?brand=' + probeBrand, {
+        method: 'POST',
+        headers: { 'x-admin-password': adminPw },
+      });
+      const data = await res.json().catch(() => null);
+      setProbeResult(data || { error: res.statusText });
+    } catch (err) {
+      setProbeResult({ error: String(err) });
+    }
+    setProbing(false);
+  }
 
   async function handlePullMymarky() {
     setPulling(true);
@@ -203,13 +226,30 @@ export function ApprovalQueue() {
   }
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem', gap: '1rem', flexWrap: 'wrap' }}>
         <h1>Autopilot</h1>
 
-        <button onClick={handlePullMymarky} className="btn" style={{ background: 'var(--border)', color: 'var(--text)' }} disabled={pulling}>
-          {pulling ? <span className="spinner" /> : null}
-          {pulling ? 'Pulling...' : 'Pull Week from Mymarky'}
-        </button>
+        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+          {/* Troubleshooting only: reveals what MyMarky really returns, so a "0 imported" result
+              can be explained instead of guessed at. */}
+          <select
+            value={probeBrand}
+            onChange={e => setProbeBrand(e.target.value as 'sae' | 'tessera' | 'hoaws')}
+            style={{ padding: '0.4rem', borderRadius: '6px', border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--text)' }}
+          >
+            <option value="sae">S.A.E Method</option>
+            <option value="tessera">Tessera Lumen</option>
+            <option value="hoaws">HOAWS</option>
+          </select>
+          <button onClick={handleProbe} className="btn" style={{ background: 'var(--border)', color: 'var(--text)' }} disabled={probing}>
+            {probing ? <span className="spinner" /> : null}
+            {probing ? 'Checking...' : 'Check MyMarky'}
+          </button>
+          <button onClick={handlePullMymarky} className="btn" style={{ background: 'var(--border)', color: 'var(--text)' }} disabled={pulling}>
+            {pulling ? <span className="spinner" /> : null}
+            {pulling ? 'Pulling...' : 'Pull Week from Mymarky'}
+          </button>
+        </div>
       </div>
 
       {drafts.length > 0 && (
@@ -272,6 +312,51 @@ export function ApprovalQueue() {
           </p>
         </div>
       </div>
+
+      {probeResult && (
+        <div className="card" style={{ marginTop: '1rem' }}>
+          <h3 style={{ marginBottom: '0.5rem' }}>MyMarky Check — {probeBrand.toUpperCase()}</h3>
+          <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: 0 }}>
+            What MyMarky actually returns for this account. Plain-language summary first, raw detail below.
+          </p>
+          {Array.isArray(probeResult.results) && (
+            <div style={{ overflowX: 'auto', marginBottom: '1rem' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', borderBottom: '1px solid var(--border)' }}>
+                    <th style={{ padding: '0.3rem' }}>Query</th>
+                    <th style={{ padding: '0.3rem' }}>HTTP</th>
+                    <th style={{ padding: '0.3rem' }}>Posts returned</th>
+                    <th style={{ padding: '0.3rem' }}>More pages?</th>
+                    <th style={{ padding: '0.3rem' }}>Newest post date</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {probeResult.results.map((r: any, i: number) => (
+                    <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}>
+                      <td style={{ padding: '0.3rem' }}>{r.query}</td>
+                      <td style={{ padding: '0.3rem' }}>{r.httpStatus ?? r.error ?? '-'}</td>
+                      <td style={{ padding: '0.3rem', fontWeight: r.returnedCount > 60 ? 'bold' : 'normal' }}>
+                        {r.returnedCount ?? '-'}
+                      </td>
+                      <td style={{ padding: '0.3rem' }}>
+                        {r.hasMore === true ? 'YES' : r.hasMore === false ? 'no' : (r.cursorFieldsPresent?.length ? 'field: ' + r.cursorFieldsPresent.join(', ') : '-')}
+                      </td>
+                      <td style={{ padding: '0.3rem' }}>{r.sampleDates?.[0]?.created_at || '-'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <details>
+            <summary style={{ cursor: 'pointer', fontSize: '0.8rem', color: 'var(--text-muted)' }}>Show raw response</summary>
+            <pre style={{ whiteSpace: 'pre-wrap', fontSize: '0.75rem', color: 'var(--text-muted)', maxHeight: '20rem', overflow: 'auto' }}>
+              {JSON.stringify(probeResult, null, 2)}
+            </pre>
+          </details>
+        </div>
+      )}
 
       {pullResult && (
         <div className="card" style={{ marginTop: '1rem' }}>
