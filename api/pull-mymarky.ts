@@ -336,10 +336,9 @@ export default async function handler(req: Request) {
           (cursor ? '&cursor=' + encodeURIComponent(cursor) : '') +
           (!cursor && page > 0 ? '&offset=' + offset : '');
         const url = MYMARKY_API + '/businesses/' + businessId + '/posts?' + qs;
-        let res: Response | null = null;
         // fetchWithTimeout, not AbortSignal.timeout: this file runs on the edge runtime, where
         // AbortSignal.timeout does not exist and throws - which turned into "0 posts" for every brand.
-        res = await fetchWithTimeout(url, { Authorization: 'Bearer ' + apiKey }, 20000);
+        const res = await fetchWithTimeout(url, { Authorization: 'Bearer ' + apiKey }, 20000);
         if (!res || !res.ok) {
           // Only the FIRST request failing is a real error. A later page being rejected just means
           // this API does not support that paging style, and the posts already collected stand.
