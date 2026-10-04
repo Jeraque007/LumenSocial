@@ -401,6 +401,46 @@ export function ApprovalQueue() {
               </table>
             </div>
           )}
+          {/* The workspace question: S.A.E/Tessera's configured workspace is ~70 days stale, so
+              list every workspace this API key can see and age each one. If the new material
+              lives in another workspace, this is where it shows up. */}
+          {Array.isArray(probeResult.workspaces) && probeResult.workspaces.length > 0 && (
+            <div style={{ overflowX: 'auto', marginBottom: '1rem' }}>
+              <p style={{ fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.3rem' }}>
+                Workspaces this API key can see
+              </p>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', borderBottom: '1px solid var(--border)' }}>
+                    <th style={{ padding: '0.3rem' }}>Workspace</th>
+                    <th style={{ padding: '0.3rem' }}>Posts</th>
+                    <th style={{ padding: '0.3rem' }}>Newest post</th>
+                    <th style={{ padding: '0.3rem' }}>Age (days)</th>
+                    <th style={{ padding: '0.3rem' }}>Importable in window</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {probeResult.workspaces.map((w: any, i: number) => (
+                    <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}>
+                      <td style={{ padding: '0.3rem' }}>
+                        {w.name}
+                        {w.configured && <span style={{ color: 'var(--accent)' }}> (reading this one)</span>}
+                        {w.error && <span style={{ color: '#d66' }}> — {w.error}</span>}
+                      </td>
+                      <td style={{ padding: '0.3rem' }}>{w.count ?? '-'}</td>
+                      <td style={{ padding: '0.3rem' }}>{w.newestCreated || '-'}</td>
+                      <td style={{ padding: '0.3rem', fontWeight: w.newestAgeDays != null && w.newestAgeDays <= 30 ? 'bold' : 'normal' }}>
+                        {w.newestAgeDays ?? '-'}
+                      </td>
+                      <td style={{ padding: '0.3rem', fontWeight: w.importableNow > 0 ? 'bold' : 'normal', color: w.importableNow > 0 ? 'var(--accent)' : undefined }}>
+                        {w.importableNow ?? '-'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
           <details>
             <summary style={{ cursor: 'pointer', fontSize: '0.8rem', color: 'var(--text-muted)' }}>Show raw response</summary>
             <pre style={{ whiteSpace: 'pre-wrap', fontSize: '0.75rem', color: 'var(--text-muted)', maxHeight: '20rem', overflow: 'auto' }}>

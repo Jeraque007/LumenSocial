@@ -1,9 +1,18 @@
-// TEMPORARY diagnostic endpoint - safe to delete once the MyMarky list shape is confirmed.
+// TEMPORARY diagnostic endpoint - safe to delete once the MyMarky workspace question is settled.
 //
-// Hits the MyMarky posts endpoint directly and reports the RAW shape of the response, plus the
-// keys of the first post. This exists because the pull's own diagnostics could not distinguish
-// "the account holds only these posts" from "we read one capped page and stopped" - both look
-// identical (60 posts, no cursor). This endpoint answers it by showing what actually came back.
+// WHAT THIS ANSWERS, AND WHY THE QUESTION CHANGED
+//
+// The pull now works: HOAWS imports 15 posts. The earlier "0 imported everywhere" was the edge
+// runtime missing AbortSignal.timeout, which is fixed.
+//
+// S.A.E and Tessera are a different problem. MyMarky returns 60 posts for each, every one of them
+// created 2026-07-26 (~70 days ago), with has_more: false and a limit cap of 100 (a limit of 500
+// is rejected with 422). Paging, offset, page and sort are all ignored - they return byte-identical
+// id lists. So there is no hidden second page. The configured workspace really is that stale.
+//
+// That leaves one question worth asking: is the new material in a DIFFERENT workspace under the
+// same API key? This endpoint enumerates every workspace the key can see, ages the newest post in
+// each, and compares them against the workspace the pull is configured to read.
 //
 // Auth: same ADMIN_PASSWORD as /api/auth-check. Never echoes the API key or any token.
 const MYMARKY_API = 'https://api.mymarky.ai/api';
@@ -17,21 +26,111 @@ const BRANDS: Record<string, { key?: string; id?: string; fallback: string }> = 
 // RUNTIME MUST MATCH api/pull-mymarky.ts.
 //
 // This probe previously had no `config`, so Vercel ran it on Node.js while pull-mymarky.ts ran on
-// the edge runtime - the probe therefore could NOT reproduce the pull's failure mode. That is
-// exactly what happened: the pull failed on edge while the probe reported healthy, which sent the
-// investigation in the wrong direction for hours. Same runtime, same fetch, same result.
+// the edge runtime - the probe therefore could NOT reproduce the pull's failure mode. Same runtime,
+// same fetch, same result.
 export const config = { runtime: 'edge', maxDuration: 60 };
 
+// The statuses the pull will actually import. Anything else is released or not ready.
+const IMPORTABLE = new Set(['NEW', 'DRAFT']);
+// The pull's default since_days. The verdict quotes it so "nothing imported" is never ambiguous.
+const WINDOW_DAYS = 30;
+const PER_REQUEST_MS = 8000;
+const MAX_WORKSPACES = 12;
+
+type Json = any;
+
+interface PostSummary {
+  count: number;
+  newestCreated: string | null;
+  oldestCreated: string | null;
+  newestAgeDays: number | null;
+  statuses: Record<string, number>;
+  // Posts that are NEW/DRAFT AND inside the window - exactly what the pull is allowed to take.
+  importableNow: number;
+}
+
+interface WorkspaceRow extends PostSummary {
+  id: string;
+  name: string;
+  configured: boolean;
+  httpStatus?: number;
+  error?: string;
+}
+
+// AbortController + setTimeout rather than AbortSignal.timeout(): this file runs on the edge
+// runtime, where AbortSignal.timeout does not exist and throws. Same reasoning as the pull.
+async function getJson(url: string, apiKey: string): Promise<{ status: number; body: Json; error?: string }> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PER_REQUEST_MS);
+  try {
+    const res = await fetch(url, { headers: { Authorization: 'Bearer ' + apiKey }, signal: ctrl.signal });
+    const text = await res.text();
+    let body: Json = null;
+    if (text) { try { body = JSON.parse(text); } catch { body = null; } }
+    return { status: res.status, body, error: res.ok ? undefined : text.slice(0, 300) };
+  } catch (e) {
+    const aborted = e instanceof Error && (e.name === 'AbortError' || e.name === 'TimeoutError');
+    if (aborted) {
+      return { status: 0, body: null, error: 'Timed out after ' + (PER_REQUEST_MS / 1000) + 's - MyMarky did not respond' };
+    }
+    return { status: 0, body: null, error: String(e).slice(0, 200) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// MyMarky has used `businesses`, `data` and a bare array in different places. Accept all three
+// rather than guessing once and reporting "0 workspaces" because of a key name.
+function pickList(body: Json): Json[] {
+  if (!body) return [];
+  if (Array.isArray(body)) return body;
+  const keys = ['businesses', 'data', 'items', 'results', 'rows'];
+  for (const k of keys) {
+    if (Array.isArray(body[k])) return body[k];
+  }
+  return [];
+}
+
+function analysePosts(items: Json[]): PostSummary {
+  const statuses: Record<string, number> = {};
+  const times: number[] = [];
+  const cutoff = Date.now() - WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  let importableNow = 0;
+
+  for (const item of items) {
+    const status = (item && item.status) || '(missing)';
+    statuses[status] = (statuses[status] || 0) + 1;
+    const raw = item && item.created_at;
+    const t = typeof raw === 'string' ? Date.parse(raw) : NaN;
+    if (Number.isNaN(t)) continue;
+    times.push(t);
+    // The pull accepts NEW and DRAFT only, and only inside the window. Count what survives both
+    // filters so the verdict can say "0 importable" as a fact rather than a guess.
+    if (IMPORTABLE.has(String(status).toUpperCase()) && t >= cutoff) importableNow++;
+  }
+
+  const newest = times.length ? Math.max.apply(null, times) : null;
+  const oldest = times.length ? Math.min.apply(null, times) : null;
+  return {
+    count: items.length,
+    newestCreated: newest === null ? null : new Date(newest).toISOString(),
+    oldestCreated: oldest === null ? null : new Date(oldest).toISOString(),
+    newestAgeDays: newest === null ? null : Math.round(((Date.now() - newest) / 86400000) * 10) / 10,
+    statuses: statuses,
+    importableNow: importableNow,
+  };
+}
+
+
 export default async function handler(req: Request) {
-  // Everything is wrapped because a 500 tells us nothing: an unhandled throw returns Vercel's
-  // own error page, not our JSON, so the UI shows an empty error and we learn nothing. This
-  // reports the real message and stack instead.
+  // Wrapped so a 500 never hides the answer: report the real message and stack instead.
   try {
     if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 });
 
     const adminPassword = process.env.ADMIN_PASSWORD;
     if (!adminPassword) return new Response('Server not configured', { status: 500 });
-    if (req.headers.get('x-admin-password') !== adminPassword) {
+    const supplied = req.headers.get('x-admin-password');
+    if (supplied !== adminPassword) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), {
         status: 401, headers: { 'Content-Type': 'application/json' },
       });
@@ -41,156 +140,177 @@ export default async function handler(req: Request) {
     const brand = BRANDS[slug];
     if (!brand) return new Response(JSON.stringify({ error: 'Unknown brand: ' + slug }), { status: 400 });
 
-    const apiKey = (process.env[brand.key || ''] || '').trim();
-    const businessId = (process.env[brand.id || ''] || '').trim() || brand.fallback;
+    const apiKey = (brand.key ? (process.env[brand.key] || '') : '').trim();
+    const businessId = (brand.id ? (process.env[brand.id] || '') : '').trim() || brand.fallback;
     if (!apiKey) return new Response(JSON.stringify({ error: 'No API key for ' + slug }), { status: 400 });
 
-    // EVERYTHING RUNS IN PARALLEL. Five sequential calls meant one slow MyMarky request stacked
-    // behind the rest, and the whole check could not return for a minute or more. Parallel, the
-    // slowest single call (~6s) sets the ceiling.
-    const PER_REQUEST_MS = 6000;
-    const TIMEOUT_ERR = 'Timed out after ' + (PER_REQUEST_MS / 1000) + 's - MyMarky did not respond';
-
-    // Three possible explanations for "60 posts, all old, no cursor": a ?page= or ?offset= page
-    // the pull never requests; a ?limit= larger than the cap; or genuinely nothing more in the
-    // account. These three queries decide between them.
-    const attempts = [
-      { label: 'baseline - what the pull sends', qs: 'limit=100', key: 'base' },
-      { label: 'page 2', qs: 'limit=100&page=2', key: 'page2' },
-      { label: 'offset 60', qs: 'limit=100&offset=60', key: 'offset' },
-      { label: 'limit 500', qs: 'limit=500', key: 'big' },
-      { label: 'newest first', qs: 'limit=100&sort=-created_at', key: 'desc' },
-    ];
-
     const started = Date.now();
-    const results = await Promise.all(attempts.map(async (attempt) => {
-      const url = MYMARKY_API + '/businesses/' + businessId + '/posts?' + attempt.qs;
-      // AbortController + setTimeout instead of AbortSignal.timeout(). This repo's MyMarky
-      // endpoints declare `runtime: 'edge'`, where AbortSignal.timeout is missing and throws;
-      // using it here risks the probe being the very thing that fails. The catch below treats the
-      // resulting AbortError the same way as a timeout, so the verdict still reads correctly.
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), PER_REQUEST_MS);
-      try {
-        const res = await fetch(url, {
-          headers: { Authorization: 'Bearer ' + apiKey },
-          signal: ctrl.signal,
+
+    // Two independent questions, asked together: what is in the workspace we read, and what other
+    // workspaces does this key see? The second is the whole point of this run.
+    const both = await Promise.all([
+      getJson(MYMARKY_API + '/businesses/' + businessId + '/posts?limit=100', apiKey),
+      getJson(MYMARKY_API + '/businesses?limit=100', apiKey),
+    ]);
+    const baselineRes = both[0];
+    const bizRes = both[1];
+
+    const baselineItems = pickList(baselineRes.body);
+    const baseline = analysePosts(baselineItems);
+
+    const rawBusinesses = pickList(bizRes.body)
+      .filter(function (b: Json) { return b && (typeof b.id === 'string' || typeof b.business_id === 'string'); })
+      .slice(0, MAX_WORKSPACES);
+
+    // Age every workspace. The configured one already has its answer, so do not pay for it twice.
+    const summaries: WorkspaceRow[] = await Promise.all(rawBusinesses.map(function (b: Json): Promise<WorkspaceRow> {
+      const id = String(b.id || b.business_id);
+      const name = String(b.name || b.business_name || b.label || '(unnamed)');
+      const configured = id === businessId;
+      if (configured) {
+        return Promise.resolve({
+          id: id, name: name, configured: true, httpStatus: baselineRes.status,
+          count: baseline.count, newestCreated: baseline.newestCreated, oldestCreated: baseline.oldestCreated,
+          newestAgeDays: baseline.newestAgeDays, statuses: baseline.statuses, importableNow: baseline.importableNow,
         });
-        const text = await res.text();
-        let body: unknown;
-        try { body = JSON.parse(text); } catch { body = null; }
-        // A JSON array body is an object too, so check for that first or Object.keys() reports
-        // meaningless numeric indices as the "top level keys".
-        const obj: Record<string, unknown> =
-          body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
-        const items: unknown[] | null = Array.isArray(body) ? (body as unknown[])
-          : Array.isArray(obj.items) ? (obj.items as unknown[])
-          : Array.isArray(obj.data) ? (obj.data as unknown[])
-          : null;
-        // Entries may be null or non-objects; every read below assumes a real object.
-        const firstItem = (items && items.length && items[0] && typeof items[0] === 'object')
-          ? (items[0] as Record<string, unknown>) : null;
-        const sampleDates = items
-          ? items.slice(0, 3).map((p) => {
-              const o = (p && typeof p === 'object') ? (p as Record<string, unknown>) : {};
-              return {
-                id: o.id ?? null,
-                status: o.status ?? null,
-                created_at: o.created_at ?? null,
-                // Any other date-ish field, so a mis-named timestamp is visible.
-                otherDates: Object.fromEntries(
-                  Object.entries(o).filter(([k, v]) => /date|time|_at$/i.test(k) && k !== 'created_at' && typeof v !== 'object'),
-                ),
-              };
-            })
-          : null;
-
-        // Post ids, so two pages can be compared for overlap - that is how we tell "page 2
-        // exists and holds different posts" from "page 2 is a repeat of page 1".
-        const ids = (items || [])
-          .filter((p) => p && typeof p === 'object')
-          .map((p) => String((p as Record<string, unknown>).id ?? ''));
-
-        return {
-          key: attempt.key,
-          query: attempt.label,
-          httpStatus: res.status,
-          topLevelKeys: Array.isArray(body) ? ['(array body)'] : Object.keys(obj),
-          returnedCount: items ? items.length : null,
-          // Post ids so pages can be compared for overlap.
-          ids,
-          // The single most useful fact: what key holds the continuation cursor, if any.
-          cursorFieldsPresent: Object.keys(obj).filter(k => /next|cursor|offset|page|has_?more/i.test(k)),
-          hasMore: obj.has_more ?? obj.hasMore ?? null,
-          nextRaw: typeof obj.next === 'string' ? obj.next.slice(0, 80)
-            : obj.next ? JSON.stringify(obj.next).slice(0, 120) : null,
-          // Field names on a post - reveals if the date is called something other than created_at,
-          // which would make every post look ancient.
-          postKeys: firstItem ? Object.keys(firstItem) : null,
-          sampleDates,
-          errorBodyPreview: res.ok ? null : text.slice(0, 300),
-        };
-      } catch (e) {
-        // A timeout is the expected failure here, so name it plainly instead of surfacing the
-        // raw "operation was aborted" message, which reads like a crash.
-        const aborted = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
-        return {
-          key: attempt.key,
-          query: attempt.label,
-          error: aborted ? TIMEOUT_ERR : (e instanceof Error ? e.message : String(e)).slice(0, 200),
-          timedOut: aborted || undefined,
-          ids: [] as string[],
-        };
-      } finally {
-        // Without this the timer would outlive the request and hold the event loop.
-        clearTimeout(timer);
       }
+      return getJson(MYMARKY_API + '/businesses/' + id + '/posts?limit=100', apiKey).then(function (res) {
+        if (res.error) {
+          return {
+            id: id, name: name, configured: false, httpStatus: res.status, error: res.error,
+            count: 0, newestCreated: null, oldestCreated: null, newestAgeDays: null,
+            statuses: {}, importableNow: 0,
+          } as WorkspaceRow;
+        }
+        const a = analysePosts(pickList(res.body));
+        return {
+          id: id, name: name, configured: false, httpStatus: res.status,
+          count: a.count, newestCreated: a.newestCreated, oldestCreated: a.oldestCreated,
+          newestAgeDays: a.newestAgeDays, statuses: a.statuses, importableNow: a.importableNow,
+        } as WorkspaceRow;
+      });
     }));
 
-    // Index results by key so the verdict below can compare pages without repeating lookups.
-    const byKey: Record<string, { returnedCount: number | null; ids: string[]; error?: string }> = {};
-    for (const r of results) {
-      byKey[r.key] = { returnedCount: r.returnedCount ?? null, ids: r.ids || [], error: r.error };
+    const foundRow = summaries.find(function (s) { return s.configured; });
+    const configuredRow: WorkspaceRow = foundRow || {
+      id: businessId, name: '(configured workspace)', configured: true, httpStatus: baselineRes.status,
+      count: baseline.count, newestCreated: baseline.newestCreated, oldestCreated: baseline.oldestCreated,
+      newestAgeDays: baseline.newestAgeDays, statuses: baseline.statuses, importableNow: baseline.importableNow,
+    };
+
+
+    // Freshest workspace by newest post, ignoring the ones we could not read.
+    let freshest: WorkspaceRow | null = null;
+    for (const s of summaries) {
+      if (s.error || s.newestAgeDays === null) continue;
+      if (!freshest || (s.newestAgeDays as number) < (freshest.newestAgeDays as number)) freshest = s;
     }
+    let configuredInList = false;
+    for (const s of summaries) { if (s.id === businessId) configuredInList = true; }
 
-    const base = byKey.base;
-    const elapsedSec = ((Date.now() - started) / 1000).toFixed(1);
-    const anyTimedOut = results.some(r => r.timedOut);
-
-    // PLAIN ENGLISH. The whole point of this endpoint is to answer one question, so answer it in
-    // one sentence instead of leaving anyone to interpret raw JSON.
+    // PLAIN ENGLISH - one sentence that decides what to do next.
     let verdict: string;
-    const extra = results.find(r =>
-      r.key !== 'base' && !r.error && (r.returnedCount || 0) > 0 &&
-      (r.ids || []).some(id => !(base?.ids || []).includes(id)));
-
-    if (anyTimedOut) {
-      verdict = 'MyMarky did not answer within ' + (PER_REQUEST_MS / 1000) +
-        ' seconds on at least one query. That is MyMarky being slow or unreachable, not a bug in LumenSocial. Try again in a minute.';
-    } else if (!base || base.error || !base.returnedCount) {
-      verdict = 'The baseline query failed, so nothing can be concluded about this account. See the error listed under "baseline".';
-    } else if (extra) {
-      verdict = 'FOUND IT. The pull only reads the first page: "' + extra.query + '" returned ' +
-        extra.returnedCount + ' posts whose ids are NOT in the first ' + base.returnedCount +
-        '. More material exists beyond what the pull fetches. Fix: follow that paging, or sort newest-first.';
-    } else if ((byKey.big?.returnedCount || 0) > (base.returnedCount || 0)) {
-      verdict = 'FOUND IT. A larger page size returns ' + byKey.big?.returnedCount +
-        ' posts instead of ' + base.returnedCount + ', so the account holds more than the one page the pull reads.';
+    if (baselineRes.error) {
+      verdict = 'The baseline query failed (HTTP ' + baselineRes.status +
+        '), so nothing can be concluded about this account. See the error under "configured workspace posts" below.';
+    } else if (bizRes.error && summaries.length === 0) {
+      verdict = 'Could not list workspaces (HTTP ' + bizRes.status +
+        '), so we cannot tell whether the new material sits in a different one. The configured workspace holds ' +
+        baseline.count + ' posts, newest ' + (baseline.newestAgeDays === null ? '?' : baseline.newestAgeDays) +
+        ' days old, ' + baseline.importableNow + ' importable inside ' + WINDOW_DAYS + ' days. Error: ' + bizRes.error;
+    } else if (configuredRow.newestAgeDays !== null
+        && configuredRow.newestAgeDays <= WINDOW_DAYS
+        && (!freshest || configuredRow.id === freshest.id
+            || (configuredRow.newestAgeDays as number) <= (freshest.newestAgeDays as number))) {
+      verdict = 'The configured workspace "' + configuredRow.name + '" has ' + configuredRow.count +
+        ' posts, newest ' + configuredRow.newestAgeDays + ' days old, and ' + configuredRow.importableNow +
+        ' of them are NEW/DRAFT inside the ' + WINDOW_DAYS +
+        '-day window. MyMarky has the material - if the pull still imported nothing, the blocker is on our side (already-pulled ledger or status filter), not MyMarky.';
+    } else if (freshest && freshest.id !== configuredRow.id
+        && (freshest.newestAgeDays as number) <= WINDOW_DAYS) {
+      verdict = 'FOUND IT. The pull reads workspace "' + configuredRow.name + '" (' + configuredRow.id +
+        '), which holds ' + configuredRow.count + ' posts, newest ' +
+        (configuredRow.newestAgeDays === null ? '?' : configuredRow.newestAgeDays) +
+        ' days old - nothing inside the ' + WINDOW_DAYS + '-day window. But workspace "' + freshest.name +
+        '" (' + freshest.id + ') under the SAME API key holds ' + freshest.count + ' posts, newest ' +
+        freshest.newestAgeDays + ' days old, ' + freshest.importableNow + ' importable. Set MYMARKY_BUSINESS_ID_' +
+        slug.toUpperCase() + ' to ' + freshest.id + ' and pull again.';
+    } else if (!configuredInList && summaries.length > 0) {
+      verdict = 'FOUND IT. The configured workspace id ' + businessId + ' is NOT among the ' + summaries.length +
+        ' workspaces this API key can see. The key is pointed at a workspace it cannot read - re-check MYMARKY_BUSINESS_ID_' +
+        slug.toUpperCase() + '.';
     } else {
-      verdict = 'MyMarky returns ' + base.returnedCount + ' posts for this account on every query shape tried, with no further page. ' +
-        'These are the real contents of the workspace - if none are recent, the account genuinely has no newer material in MyMarky.';
+      verdict = 'This API key sees ' + summaries.length + ' workspace(s) and none of them holds material newer than ' +
+        WINDOW_DAYS + ' days. The freshest is "' + (freshest ? freshest.name : 'n/a') + '" at ' +
+        (freshest ? freshest.newestAgeDays : '?') + ' days old. The new material is either in a different MyMarky account (a different API key) or was never pushed into MyMarky.';
     }
 
-    return new Response(JSON.stringify({ brand: slug, businessId, elapsedSec, verdict, results }, null, 2), {
-      headers: { 'Content-Type': 'application/json' },
+
+    // Rows for the existing table. Field names match what ApprovalQueue.tsx already renders:
+    // query, httpStatus, returnedCount, hasMore, sampleDates[0].created_at.
+    const baseKeys = (baselineRes.body && typeof baselineRes.body === 'object')
+      ? Object.keys(baselineRes.body).filter(function (k) {
+          return k.indexOf('cursor') !== -1 || k.indexOf('next') !== -1 || k === 'has_more';
+        })
+      : [];
+    const results: Json[] = [
+      {
+        key: 'base',
+        query: 'configured workspace posts (limit=100)',
+        httpStatus: baselineRes.status,
+        returnedCount: baseline.count,
+        hasMore: baselineRes.body ? baselineRes.body.has_more : null,
+        cursorFieldsPresent: baseKeys,
+        nextRaw: baselineRes.body ? baselineRes.body.next_cursor : null,
+        statuses: baseline.statuses,
+        importableNow: baseline.importableNow,
+        sampleDates: [{ id: businessId, created_at: baseline.newestCreated, note: 'newest of ' + baseline.count }],
+        error: baselineRes.error,
+      },
+      {
+        key: 'list',
+        query: 'workspace list (GET /businesses)',
+        httpStatus: bizRes.status,
+        returnedCount: summaries.length,
+        hasMore: null,
+        cursorFieldsPresent: [],
+        sampleDates: [],
+        error: bizRes.error,
+      },
+    ];
+    summaries.forEach(function (s, i) {
+      results.push({
+        key: 'ws' + i,
+        query: 'workspace: ' + s.name + (s.configured ? ' (configured)' : ''),
+        httpStatus: s.httpStatus === undefined ? null : s.httpStatus,
+        returnedCount: s.count,
+        hasMore: null,
+        cursorFieldsPresent: [],
+        statuses: s.statuses,
+        importableNow: s.importableNow,
+        sampleDates: [{ id: s.id, created_at: s.newestCreated, note: 'newest of ' + s.count }],
+        error: s.error,
+      });
     });
+
+    const elapsedSec = ((Date.now() - started) / 1000).toFixed(1);
+    const payload = {
+      brand: slug,
+      businessId: businessId,
+      elapsedSec: elapsedSec,
+      verdict: verdict,
+      configuredWorkspace: configuredRow,
+      workspaces: summaries,
+      results: results,
+    };
+    return new Response(JSON.stringify(payload, null, 2), { headers: { 'Content-Type': 'application/json' } });
   } catch (e) {
-    // The whole point: never fail opaquely again.
-    return new Response(JSON.stringify({
-      error: e instanceof Error ? e.message : String(e),
-      stack: e instanceof Error ? (e.stack || '').split('\n').slice(0, 6) : null,
-    }, null, 2), {
+    // Never fail opaquely: report the real message and stack.
+    const err = e instanceof Error ? e.message : String(e);
+    const stack = e instanceof Error && e.stack ? e.stack.split('\n').slice(0, 6) : null;
+    return new Response(JSON.stringify({ error: err, stack: stack }, null, 2), {
       status: 500, headers: { 'Content-Type': 'application/json' },
     });
   }
 }
+
