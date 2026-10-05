@@ -46,6 +46,9 @@ export function ApprovalQueue() {
   
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editContent, setEditContent] = useState('');
+  // YouTube is the only platform whose text is a heading PLUS a body. Everything else is one
+  // caption, so this stays empty for them and never reaches the database.
+  const [editTitle, setEditTitle] = useState('');
   const [editMediaUrls, setEditMediaUrls] = useState<string[]>([]);
   const [editVideoUrl, setEditVideoUrl] = useState('');
   const [showLibrary, setShowLibrary] = useState(false);
@@ -274,17 +277,48 @@ export function ApprovalQueue() {
 
   function startEdit(post: DraftPost) {
     setEditingId(post.id);
-    setEditContent(post.content);
     setEditVideoUrl(post.video_url || '');
     try {
       setEditMediaUrls(post.media_urls ? JSON.parse(post.media_urls) : (post.media_url ? [post.media_url] : []));
     } catch { setEditMediaUrls(post.media_url ? [post.media_url] : []); }
+
+    if (post.platform !== 'youtube') {
+      setEditTitle('');
+      setEditContent(post.content);
+      return;
+    }
+
+    // YouTube content is either JSON {"title","description"} or the plain text the pull writes.
+    // Either way both boxes are filled, so the editor always shows the heading YouTube will
+    // actually use instead of forcing the user to edit raw JSON to get at it.
+    const parsed = parseYouTubeContent(post.content);
+    if (parsed) {
+      setEditTitle(parsed.title || '');
+      setEditContent(parsed.description || '');
+    } else {
+      // Plain text: mirror exactly what the connector derives - title = first 100 chars,
+      // description = the whole string. Saving that back as JSON is a no-op behaviourally,
+      // but it makes the heading independently editable from then on.
+      setEditTitle(post.content.substring(0, 100));
+      setEditContent(post.content);
+    }
   }
 
   async function handleSaveEdit() {
     if (!editingId) return;
+    // YouTube stores the heading and body as JSON {"title","description"} so the heading survives
+    // independently. A blank heading falls back to plain text rather than JSON with an empty
+    // title - otherwise the connector would derive its title from the literal string
+    // '{"title":""...' and the video would be published with garbage for a heading.
+    const editingPost = drafts.find(d => d.id === editingId);
+    const isYoutube = editingPost?.platform === 'youtube';
+    const title = editTitle.trim();
+    const content = isYoutube && title
+      ? JSON.stringify({ title, description: editContent })
+      : editContent;
+
     await supabase.from('scheduled_posts').update({
-      content: editContent,
+      content,
       media_url: editVideoUrl || editMediaUrls[0] || null,
       media_urls: JSON.stringify(editMediaUrls),
       video_url: editVideoUrl || null,
@@ -592,9 +626,28 @@ export function ApprovalQueue() {
                         <span style={{ color: 'var(--text-muted)' }}>Max {limits?.charLimit} chars | {limits?.mediaType === 'video' ? 'Video' : 'Max ' + limits?.maxImages + ' images'}</span>
                       </div>
                       <div className="form-group">
-                        <label>Caption ({editContent.length}/{limits?.charLimit || '?'})</label>
-                        <textarea className="textarea" value={editContent} onChange={e => setEditContent(e.target.value)}
-                          style={{ borderColor: editContent.length > (limits?.charLimit || 9999) ? 'var(--error)' : undefined }} />
+                        {post.platform === 'youtube' ? (
+                          <>
+                            <label>Title ({editTitle.length}/100)</label>
+                            <input
+                              type="text"
+                              value={editTitle}
+                              onChange={e => setEditTitle(e.target.value)}
+                              maxLength={100}
+                              placeholder="YouTube video heading — max 100 characters"
+                              style={{ width: '100%', padding: '0.5rem', borderRadius: '6px', border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--text)', marginBottom: '0.6rem', boxSizing: 'border-box' }}
+                            />
+                            <label>Description ({editContent.length}/{limits?.charLimit || '?'})</label>
+                            <textarea className="textarea" value={editContent} onChange={e => setEditContent(e.target.value)}
+                              style={{ borderColor: editContent.length > (limits?.charLimit || 9999) ? 'var(--error)' : undefined }} />
+                          </>
+                        ) : (
+                          <>
+                            <label>Caption ({editContent.length}/{limits?.charLimit || '?'})</label>
+                            <textarea className="textarea" value={editContent} onChange={e => setEditContent(e.target.value)}
+                              style={{ borderColor: editContent.length > (limits?.charLimit || 9999) ? 'var(--error)' : undefined }} />
+                          </>
+                        )}
                       </div>
 
                       {limits?.mediaType !== 'video' && (

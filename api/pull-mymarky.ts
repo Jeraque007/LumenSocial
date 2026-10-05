@@ -44,6 +44,10 @@ const BRANDS = [
     // catches this case automatically, so the fallback matters mainly for the report.
     businessId: () => process.env.MYMARKY_BUSINESS_ID_SAE || 'cd72203a-32bf-4832-9b72-6bb767b2da90',
     scheduleHour: 8,
+    // Only S.A.E Method has a YouTube channel wired up today. HOAWS and Tessera do NOT, so they
+    // are false below - creating youtube rows for them would only produce failures. Set a brand
+    // to true once its channel exists; nothing else in the pull needs to change.
+    youtube: true,
   },
   {
     name: 'Tessera Lumen',
@@ -51,6 +55,7 @@ const BRANDS = [
     // 2026-10-04: replaced 1ad527e6-... for the same reason as S.A.E above.
     businessId: () => process.env.MYMARKY_BUSINESS_ID_TESSERA || 'e2258821-9e9a-43b0-bff3-0e7419d6368a',
     scheduleHour: 13,
+    youtube: false,
   },
   {
     // scheduled_posts.brand must be exactly 'HOAWS' for the Facebook/Instagram/LinkedIn connectors
@@ -60,6 +65,7 @@ const BRANDS = [
     apiKey: () => process.env.MYMARKY_API_KEY_HOAWS || '',
     businessId: () => process.env.MYMARKY_BUSINESS_ID_HOAWS || 'd36bd055-5dca-49e7-b1d4-2f218e6c051f',
     scheduleHour: 16,
+    youtube: false,
   },
 ];
 
@@ -651,6 +657,9 @@ export default async function handler(req: Request) {
           // YouTube cannot publish a still image, so an image-only source post must not produce a
           // youtube row - it would sit in the queue and fail on release every time.
           if (platform === 'youtube' && !video) continue;
+          // Only brands that actually own a YouTube channel get a row. Right now that is S.A.E
+          // Method alone - HOAWS has no channel yet, and a row for it would just fail on release.
+          if (platform === 'youtube' && !brand.youtube) continue;
           const rules = PLATFORM_RULES[platform];
           const content = trimCaption(caption, rules.charLimit);
           const imgs = images.slice(0, rules.maxImages);
