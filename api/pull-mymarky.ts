@@ -67,6 +67,9 @@ const PLATFORM_RULES: Record<string, { charLimit: number; maxImages: number }> =
   linkedin: { charLimit: 3000, maxImages: 20 },
   facebook: { charLimit: 63206, maxImages: 3 },
   instagram: { charLimit: 2200, maxImages: 10 },
+  // YouTube: video only, no images (maxImages 0), description cap 5000 characters. The pull skips
+  // this platform entirely when the source post has no video - see the guard in the loop below.
+  youtube: { charLimit: 5000, maxImages: 0 },
 };
 const PLATFORMS = Object.keys(PLATFORM_RULES);
 
@@ -645,6 +648,9 @@ export default async function handler(req: Request) {
 
         let insertedAny = false;
         for (const platform of PLATFORMS) {
+          // YouTube cannot publish a still image, so an image-only source post must not produce a
+          // youtube row - it would sit in the queue and fail on release every time.
+          if (platform === 'youtube' && !video) continue;
           const rules = PLATFORM_RULES[platform];
           const content = trimCaption(caption, rules.charLimit);
           const imgs = images.slice(0, rules.maxImages);

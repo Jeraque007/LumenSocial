@@ -9,13 +9,15 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-type Platform = 'linkedin' | 'facebook' | 'instagram';
+type Platform = 'linkedin' | 'facebook' | 'instagram' | 'youtube';
 
 async function postToPlatform(platform: Platform, content: string, mediaUrl?: string, brand?: string) {
   switch (platform) {
     case 'linkedin': { const { postToLinkedin } = await import('../src/lib/connectors/linkedin'); return postToLinkedin(content, mediaUrl, brand); }
     case 'facebook': { const { postToFacebook } = await import('../src/lib/connectors/facebook'); return postToFacebook(content, mediaUrl, brand); }
     case 'instagram': { const { postToInstagram } = await import('../src/lib/connectors/instagram'); return postToInstagram(content, mediaUrl, brand); }
+    // YouTube takes no brand routing - one channel per Google grant.
+    case 'youtube': { const { postToYoutube } = await import('../src/lib/connectors/youtube'); return postToYoutube(content, mediaUrl); }
     default: return { success: false, error: 'Unsupported platform: ' + platform };
   }
 }

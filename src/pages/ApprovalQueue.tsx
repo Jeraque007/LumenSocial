@@ -13,6 +13,9 @@ interface DraftPost {
   brand: string | null;
   pillar: string | null;
   created_at: string;
+  // MyMarky source id with the platform suffix, e.g. "abc123_linkedin". Null for posts written by
+  // hand rather than pulled. REJECT needs it to find the ledger entry for the source post.
+  mymarky_id?: string | null;
 }
 
 interface MediaItem {
@@ -25,13 +28,15 @@ interface MediaItem {
 }
 
 const PLATFORM_LABELS: Record<string, string> = {
-  linkedin: 'LinkedIn', facebook: 'Facebook', instagram: 'Instagram',
+  linkedin: 'LinkedIn', facebook: 'Facebook', instagram: 'Instagram', youtube: 'YouTube',
 };
 
 const PLATFORM_LIMITS: Record<string, { charLimit: number; maxImages: number; mediaType: string }> = {
   linkedin: { charLimit: 3000, maxImages: 20, mediaType: 'both' },
   facebook: { charLimit: 63206, maxImages: 3, mediaType: 'both' },
   instagram: { charLimit: 2200, maxImages: 10, mediaType: 'both' },
+  // YouTube accepts a video only - no still images - and its description cap is 5000 characters.
+  youtube: { charLimit: 5000, maxImages: 0, mediaType: 'video' },
 };
 export function ApprovalQueue() {
   const [drafts, setDrafts] = useState<DraftPost[]>([]);
@@ -54,6 +59,17 @@ export function ApprovalQueue() {
   const [pullDays, setPullDays] = useState(10);
   // How far back to accept MyMarky material, in days. Anything older is skipped. 0 = no limit.
   const [pullSinceDays, setPullSinceDays] = useState(30);
+  // The most recent row removed by DELETE, held so a mis-click is reversible. Persisted for this
+  // browser session only - it is a safety net, not a recycle bin, and deliberately never touches
+  // the mymarky_seen ledger (restoring must not re-import or duplicate anything).
+  const [lastDeleted, setLastDeleted] = useState<DraftPost | null>(null);
+
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem('lumen_last_deleted');
+      if (raw) setLastDeleted(JSON.parse(raw));
+    } catch { /* corrupt or unavailable storage - start with no undo available */ }
+  }, []);
 
   // Asks MyMarky what its posts endpoint actually returns, instead of inferring it. The pull can
   // only report what it read - when every brand reports the same 60 posts with no cursor, this is
@@ -186,15 +202,74 @@ export function ApprovalQueue() {
     fetchDrafts();
   }
 
+  // REJECT and DELETE are opposites, and that is the whole point.
+  //
+  //   REJECT  = "not this one, send it back" - the rows go away AND the mymarky_seen ledger entry
+  //             is released, so the next pull fetches the source post again.
+  //   DELETE  = "never use this" - the row goes away and the ledger entry stays, so the source post
+  //             is permanently excluded. Undo below covers an accidental click.
+  //
+  // The ledger is only released when the LAST copy of that source post leaves Lumen. One MyMarky
+  // post fans out to a row per platform, so rejecting just the LinkedIn copy while Facebook and
+  // Instagram are still queued must NOT make the whole post pullable again - it is still here.
   async function handleReject(id: string) {
-    await supabase.from('scheduled_posts')
-      .update({ status: 'rejected', updated_at: new Date().toISOString() }).eq('id', id);
+    const row = drafts.find(d => d.id === id);
+    await supabase.from('scheduled_posts').delete().eq('id', id);
+
+    const sourceId = sourcePostId(row);
+    if (sourceId && row?.brand) {
+      const { data: stillHere } = await supabase
+        .from('scheduled_posts')
+        .select('id, mymarky_id')
+        .eq('brand', row.brand)
+        .not('mymarky_id', 'is', null);
+      const copiesLeft = (stillHere || []).filter(r => {
+        const m = r.mymarky_id as string | null;
+        return !!m && (m === sourceId || m.startsWith(sourceId + '_'));
+      });
+      if (copiesLeft.length === 0) {
+        await supabase
+          .from('mymarky_seen')
+          .delete()
+          .eq('mymarky_id', sourceId)
+          .eq('brand', row.brand);
+      }
+    }
     fetchDrafts();
   }
 
   async function handleDelete(id: string) {
+    const row = drafts.find(d => d.id === id);
     await supabase.from('scheduled_posts').delete().eq('id', id);
+    if (row) {
+      setLastDeleted(row);
+      try { sessionStorage.setItem('lumen_last_deleted', JSON.stringify(row)); } catch { /* ignore */ }
+    }
     fetchDrafts();
+  }
+
+  // Put back exactly what was deleted, with its original id. The ledger entry was never touched,
+  // so this restores the scheduled row - it does not re-import and cannot duplicate.
+  async function handleUndoDelete() {
+    if (!lastDeleted) return;
+    const { error } = await supabase.from('scheduled_posts').insert(lastDeleted);
+    if (error) {
+      alert('Could not restore that post: ' + error.message);
+      return;
+    }
+    setLastDeleted(null);
+    try { sessionStorage.removeItem('lumen_last_deleted'); } catch { /* ignore */ }
+    fetchDrafts();
+  }
+
+  // MyMarky stores the source id as "<source>_<platform>". Strip the suffix we know was appended
+  // rather than splitting on "_" - MyMarky ids can themselves contain underscores.
+  function sourcePostId(row?: DraftPost | null): string | null {
+    if (!row?.mymarky_id) return null;
+    const suffix = '_' + row.platform;
+    return row.mymarky_id.endsWith(suffix)
+      ? row.mymarky_id.slice(0, row.mymarky_id.length - suffix.length)
+      : row.mymarky_id;
   }
 
   function startEdit(post: DraftPost) {
@@ -285,6 +360,20 @@ export function ApprovalQueue() {
         <div style={{ marginBottom: '1rem', display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
           <button onClick={handleApproveAll} className="btn btn-primary">Approve All ({drafts.length})</button>
           <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{drafts.length} drafts pending review</span>
+        </div>
+      )}
+
+      {lastDeleted && (
+        <div style={{ marginBottom: '1rem', display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+          <button onClick={handleUndoDelete} className="btn" style={{ background: 'var(--border)', color: 'var(--text)' }}>
+            Undo last delete
+          </button>
+          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+            {PLATFORM_LABELS[lastDeleted.platform] || lastDeleted.platform}
+            {lastDeleted.brand ? ' · ' + lastDeleted.brand : ''}
+            {' · '}{new Date(lastDeleted.scheduled_at).toLocaleDateString('en-ZA', { weekday: 'short', day: 'numeric', month: 'short' })}
+            {' '}— restores the row without re-pulling it.
+          </span>
         </div>
       )}
 
