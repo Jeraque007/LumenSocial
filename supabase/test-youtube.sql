@@ -40,7 +40,7 @@ INSERT INTO scheduled_posts (
 ) VALUES (
   'LumenSocial YouTube connectivity test - safe to delete after checking. #LumenSocial',
   NULL,
-  'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
+  'https://mdn.github.io/shared-assets/videos/flower.mp4',
   'youtube',
   NOW() - INTERVAL '1 minute',
   'pending',
