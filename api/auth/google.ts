@@ -36,7 +36,13 @@ export default async function handler(req: Request) {
   authUrl.searchParams.set('response_type', 'code');
   authUrl.searchParams.set('scope', scopes);
   authUrl.searchParams.set('access_type', 'offline');
-  authUrl.searchParams.set('prompt', 'consent');
+  // Force BOTH the account chooser and a fresh consent screen. Without select_account, Google can
+  // skip straight to consent using the last-active identity - and if that identity is the Brand
+  // Account's pages identity (…@pages.plusgoogle.com), consent dies with "Service unavailable -
+  // You tried to access a service that isn't available for your account". With the chooser forced,
+  // the operator explicitly picks the main Gmail account; the CHANNEL the grant then binds to is
+  // the account's default channel (set beforehand at youtube.com/advanced - see .env.example).
+  authUrl.searchParams.set('prompt', 'consent select_account');
   authUrl.searchParams.set('state', brand);
 
   return Response.redirect(authUrl.toString(), 302);
