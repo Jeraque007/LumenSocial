@@ -12,12 +12,23 @@ export default async function handler(req: Request) {
   const brand = (url.searchParams.get('brand') || '').trim().toLowerCase() === 'hoaws' ? 'HOAWS' : 'SAE';
   const clientId = process.env.GOOGLE_CLIENT_ID!;
   const redirectUri = 'https://lumensocial.vercel.app/api/auth/callback';
-  
-  const scopes = [
-    'https://www.googleapis.com/auth/youtube.upload',
-    'https://www.googleapis.com/auth/youtube',
-    'https://www.googleapis.com/auth/business.manage',
-  ].join(' ');
+
+  // The HOAWS channel lives on a Brand Account, and Google answers a brand-account consent that
+  // includes business.manage with "Service unavailable - You tried to access a service that isn't
+  // available for your account". The HOAWS grant only ever uploads videos (Google Business Profile
+  // follows the S.A.E / YOUTUBE_* grant), so it requests the YouTube scopes alone. The S.A.E visit
+  // keeps business.manage so the Google Business fallback token stays renewable.
+  const scopes = (brand === 'HOAWS'
+    ? [
+        'https://www.googleapis.com/auth/youtube.upload',
+        'https://www.googleapis.com/auth/youtube',
+      ]
+    : [
+        'https://www.googleapis.com/auth/youtube.upload',
+        'https://www.googleapis.com/auth/youtube',
+        'https://www.googleapis.com/auth/business.manage',
+      ]
+  ).join(' ');
 
   const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
   authUrl.searchParams.set('client_id', clientId);
