@@ -21,8 +21,9 @@ export async function postToPlatform(
     case 'instagram':
       return postToInstagram(content, mediaUrl, brand);
     case 'youtube':
-      // No brand argument: postToYoutube uploads to the channel authorized by the Google grant.
-      return postToYoutube(content, mediaUrl);
+      // Brand routing picks which Google grant uploads: 'HOAWS' uses HOAWS_YOUTUBE_* (@HOAWS-963),
+      // everything else uses YOUTUBE_* (@sylvana_sae).
+      return postToYoutube(content, mediaUrl, brand);
     default:
       return { success: false, error: `Unsupported platform: ${platform}` };
   }

@@ -44,9 +44,11 @@ const BRANDS = [
     // catches this case automatically, so the fallback matters mainly for the report.
     businessId: () => process.env.MYMARKY_BUSINESS_ID_SAE || 'cd72203a-32bf-4832-9b72-6bb767b2da90',
     scheduleHour: 8,
-    // Only S.A.E Method has a YouTube channel wired up today. HOAWS and Tessera do NOT, so they
-    // are false below - creating youtube rows for them would only produce failures. Set a brand
-    // to true once its channel exists; nothing else in the pull needs to change.
+    // S.A.E Method (@sylvana_sae, UC05CiyeaqlzPXFEeAO485OQ) and HOAWS (@HOAWS-963,
+    // UCvcko1F9hbSN2cYEJgRnkvQ) both have YouTube channels wired up - they share ONE Google
+    // account, but each brand posts with its own grant (YOUTUBE_* / HOAWS_YOUTUBE_*). Tessera
+    // Lumen has no channel, so it stays false - creating youtube rows for it would only produce
+    // failures. Set a brand to true once its channel exists; nothing else in the pull changes.
     youtube: true,
   },
   {
@@ -65,7 +67,9 @@ const BRANDS = [
     apiKey: () => process.env.MYMARKY_API_KEY_HOAWS || '',
     businessId: () => process.env.MYMARKY_BUSINESS_ID_HOAWS || 'd36bd055-5dca-49e7-b1d4-2f218e6c051f',
     scheduleHour: 16,
-    youtube: false,
+    // HOAWS owns a YouTube channel from 2026-10-08 (@HOAWS-963 / UCvcko1F9hbSN2cYEJgRnkvQ), so
+    // video posts now import a youtube row too. It uploads with HOAWS_YOUTUBE_* credentials.
+    youtube: true,
   },
 ];
 
@@ -657,8 +661,8 @@ export default async function handler(req: Request) {
           // YouTube cannot publish a still image, so an image-only source post must not produce a
           // youtube row - it would sit in the queue and fail on release every time.
           if (platform === 'youtube' && !video) continue;
-          // Only brands that actually own a YouTube channel get a row. Right now that is S.A.E
-          // Method alone - HOAWS has no channel yet, and a row for it would just fail on release.
+          // Only brands that actually own a YouTube channel get a row. That is S.A.E Method and
+          // HOAWS - Tessera Lumen has no channel yet, and a row for it would just fail on release.
           if (platform === 'youtube' && !brand.youtube) continue;
           const rules = PLATFORM_RULES[platform];
           const content = trimCaption(caption, rules.charLimit);

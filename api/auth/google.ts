@@ -1,7 +1,15 @@
 // Starts the Google OAuth flow for YouTube + Google Business
 // Visit this URL to begin authorization
+//   /api/auth/google              -> S.A.E Method channel; result page labels YOUTUBE_* vars
+//   /api/auth/google?brand=HOAWS  -> HOAWS channel;         result page labels HOAWS_YOUTUBE_* vars
+// Both channels live under one Google account, but a grant only ever posts to the channel picked
+// during THIS authorization (the YouTube API has no channel selector), so each brand gets its own
+// visit - select the target channel in Google's account / brand-account chooser.
 
-export default async function handler(_req: Request) {
+export default async function handler(req: Request) {
+  const url = new URL(req.url);
+  // Round-trips through OAuth `state` so /api/auth/callback knows which brand's vars to label.
+  const brand = (url.searchParams.get('brand') || '').trim().toLowerCase() === 'hoaws' ? 'HOAWS' : 'SAE';
   const clientId = process.env.GOOGLE_CLIENT_ID!;
   const redirectUri = 'https://lumensocial.vercel.app/api/auth/callback';
   
@@ -18,6 +26,7 @@ export default async function handler(_req: Request) {
   authUrl.searchParams.set('scope', scopes);
   authUrl.searchParams.set('access_type', 'offline');
   authUrl.searchParams.set('prompt', 'consent');
+  authUrl.searchParams.set('state', brand);
 
   return Response.redirect(authUrl.toString(), 302);
 }

@@ -13,9 +13,12 @@ async function postToPlatform(platform: Platform, content: string, mediaUrl?: st
     case 'linkedin': { const { postToLinkedin } = await import('../../src/lib/connectors/linkedin'); return postToLinkedin(content, mediaUrl, brand); }
     case 'facebook': { const { postToFacebook } = await import('../../src/lib/connectors/facebook'); return postToFacebook(content, mediaUrl, brand); }
     case 'instagram': { const { postToInstagram } = await import('../../src/lib/connectors/instagram'); return postToInstagram(content, mediaUrl, brand); }
-    // YouTube takes no brand routing - it uploads to the single channel authorized by the Google
-    // grant - and postToYoutube derives its title/description from `content` itself.
-    case 'youtube': { const { postToYoutube } = await import('../../src/lib/connectors/youtube'); return postToYoutube(content, mediaUrl); }
+    // YouTube routes by the scheduled post's brand: 'HOAWS' uploads with HOAWS_YOUTUBE_* (the
+    // @HOAWS-963 channel), everything else with YOUTUBE_* (the @sylvana_sae channel). Both grants
+    // come from the same Google account, but each token only ever posts to its own channel - the
+    // connector verifies that before uploading. postToYoutube derives title/description from
+    // `content` itself.
+    case 'youtube': { const { postToYoutube } = await import('../../src/lib/connectors/youtube'); return postToYoutube(content, mediaUrl, brand); }
     default: return { success: false, error: 'Unsupported platform: ' + platform };
   }
 }

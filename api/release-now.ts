@@ -16,8 +16,9 @@ async function postToPlatform(platform: Platform, content: string, mediaUrl?: st
     case 'linkedin': { const { postToLinkedin } = await import('../src/lib/connectors/linkedin'); return postToLinkedin(content, mediaUrl, brand); }
     case 'facebook': { const { postToFacebook } = await import('../src/lib/connectors/facebook'); return postToFacebook(content, mediaUrl, brand); }
     case 'instagram': { const { postToInstagram } = await import('../src/lib/connectors/instagram'); return postToInstagram(content, mediaUrl, brand); }
-    // YouTube takes no brand routing - one channel per Google grant.
-    case 'youtube': { const { postToYoutube } = await import('../src/lib/connectors/youtube'); return postToYoutube(content, mediaUrl); }
+    // YouTube routes by brand: 'HOAWS' -> HOAWS_YOUTUBE_* (@HOAWS-963), otherwise YOUTUBE_*
+    // (@sylvana_sae). One Google account, one channel per grant - the connector verifies it.
+    case 'youtube': { const { postToYoutube } = await import('../src/lib/connectors/youtube'); return postToYoutube(content, mediaUrl, brand); }
     default: return { success: false, error: 'Unsupported platform: ' + platform };
   }
 }
